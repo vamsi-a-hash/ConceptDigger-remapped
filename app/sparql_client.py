@@ -1,0 +1,158 @@
+"""
+Async SPARQL client. Each method here is the live-query replacement for one
+of the legacy bulk .nt dump files:
+
+    skos_categories_en.nt          -> fetch_subcategories   (skos:broader)
+    article_categories_en.nt       -> fetch_member_articles (dct:subject)
+    labels_en.nt                   -> fetch_labels          (rdfs:label)
+    mappingbased_properties_en.nt  -> fetch_alt_names       (dbo:alias, dbp:name,
+                                                              dbp:alternateName, foaf:name)
+    redirects_en.nt                -> fetch_redirect_sources    (dbo:wikiPageRedirects)
+    disambiguations_en.nt          -> fetch_disambiguation_sources (dbo:wikiPageDisambiguates)
+
+bold_keywords.nt has no SPARQL equivalent — it was mined from raw Wikipedia
+XML dumps by wikipedia_bold_to_ntriple_file.py, which stays a standalone,
+decoupled offline tool (see that file). It is not part of live hydration.
+
+Note on direction for redirects/disambiguations: the legacy code read
+"<subject> predicate <object>" and attached the *subject's* URI-derived label
+as a synonym of the *object* (e.g. a redirect page's name becomes an
+alternate name for the canonical page it points to). To reproduce that for
+an entity E, we query for the *subjects* that point at E.
+"""
+import asyncio
+import time
+from typing import List
+
+import httpx
+
+from .config import settings
+
+# HTTP statuses worth retrying after a backoff — 429 (rate limited) and 503
+# (endpoint temporarily overloaded), matching DBpedia's own operational
+# guidance for its public SPARQL endpoint.
+_RETRYABLE_STATUSES = {429, 503}
+
+_PREFIXES = """
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX dct: <http://purl.org/dc/terms/>
+PREFIX dbo: <http://dbpedia.org/ontology/>
+PREFIX dbp: <http://dbpedia.org/property/>
+PREFIX foaf: <http://xmlns.com/foaf/0.1/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+"""
+
+
+def _to_full_uri(local_name: str) -> str:
+    return f"<{settings.dbpedia_resource_prefix}{local_name}>"
+
+
+def _local_name_from_uri(uri: str) -> str:
+    prefix = settings.dbpedia_resource_prefix
+    return uri[len(prefix):] if uri.startswith(prefix) else uri
+
+
+class SparqlClient:
+    def __init__(
+        self,
+        endpoint: str,
+        timeout: float,
+        min_interval: float = 0.0,
+        max_retries: int = 0,
+    ):
+        self.endpoint = endpoint
+        self.timeout = timeout
+        self.min_interval = min_interval
+        self.max_retries = max_retries
+        # Guards the shared "last call" clock below so concurrent requests
+        # (different /dig batches, hydrate calls, etc.) all queue through the
+        # same throttle instead of racing past it in parallel.
+        self._throttle_lock = asyncio.Lock()
+        self._last_call_at = 0.0
+
+    async def _throttle(self) -> None:
+        """Block until at least `min_interval` seconds have passed since the
+        previous outgoing SPARQL call, across the whole process."""
+        if self.min_interval <= 0:
+            return
+        async with self._throttle_lock:
+            now = time.monotonic()
+            wait = self.min_interval - (now - self._last_call_at)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_call_at = time.monotonic()
+
+    async def _run(self, client: httpx.AsyncClient, query: str) -> List[dict]:
+        attempt = 0
+        while True:
+            await self._throttle()
+            resp = await client.get(
+                self.endpoint,
+                params={"query": _PREFIXES + query, "format": "application/sparql-results+json"},
+                headers={"Accept": "application/sparql-results+json"},
+                timeout=self.timeout,
+            )
+            if resp.status_code in _RETRYABLE_STATUSES and attempt < self.max_retries:
+                attempt += 1
+                # Honor the server's Retry-After header when it gives one;
+                # otherwise fall back to a short exponential backoff. Either
+                # way this sleep is in addition to the steady-state throttle
+                # above, not a replacement for it.
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    delay = float(retry_after) if retry_after else 2.0 * attempt
+                except ValueError:
+                    delay = 2.0 * attempt
+                await asyncio.sleep(delay)
+                continue
+            resp.raise_for_status()
+            break
+        payload = resp.json()
+        return payload["results"]["bindings"]
+
+    async def fetch_subcategories(self, client: httpx.AsyncClient, local_name: str) -> List[str]:
+        q = f"SELECT DISTINCT ?child WHERE {{ ?child skos:broader {_to_full_uri(local_name)} }}"
+        rows = await self._run(client, q)
+        return [_local_name_from_uri(r["child"]["value"]) for r in rows]
+
+    async def fetch_member_articles(self, client: httpx.AsyncClient, local_name: str) -> List[str]:
+        q = f"SELECT DISTINCT ?article WHERE {{ ?article dct:subject {_to_full_uri(local_name)} }}"
+        rows = await self._run(client, q)
+        return [_local_name_from_uri(r["article"]["value"]) for r in rows]
+
+    async def fetch_labels(self, client: httpx.AsyncClient, local_name: str) -> List[str]:
+        uri = _to_full_uri(local_name)
+        q = f"SELECT DISTINCT ?label WHERE {{ {uri} rdfs:label ?label . FILTER (lang(?label) = 'en') }}"
+        rows = await self._run(client, q)
+        return [r["label"]["value"] for r in rows]
+
+    async def fetch_alt_names(self, client: httpx.AsyncClient, local_name: str) -> List[str]:
+        uri = _to_full_uri(local_name)
+        q = (
+            "SELECT DISTINCT ?name WHERE { "
+            f"{{ {uri} dbo:alias ?name }} UNION "
+            f"{{ {uri} dbp:name ?name }} UNION "
+            f"{{ {uri} dbp:alternateName ?name }} UNION "
+            f"{{ {uri} foaf:name ?name }} "
+            "}"
+        )
+        rows = await self._run(client, q)
+        return [r["name"]["value"] for r in rows]
+
+    async def fetch_redirect_sources(self, client: httpx.AsyncClient, local_name: str) -> List[str]:
+        q = f"SELECT DISTINCT ?s WHERE {{ ?s dbo:wikiPageRedirects {_to_full_uri(local_name)} }}"
+        rows = await self._run(client, q)
+        return [_local_name_from_uri(r["s"]["value"]) for r in rows]
+
+    async def fetch_disambiguation_sources(self, client: httpx.AsyncClient, local_name: str) -> List[str]:
+        q = f"SELECT DISTINCT ?s WHERE {{ ?s dbo:wikiPageDisambiguates {_to_full_uri(local_name)} }}"
+        rows = await self._run(client, q)
+        return [_local_name_from_uri(r["s"]["value"]) for r in rows]
+
+
+sparql_client = SparqlClient(
+    settings.sparql_endpoint,
+    settings.sparql_timeout_seconds,
+    min_interval=settings.sparql_min_interval_seconds,
+    max_retries=settings.sparql_max_retries,
+)
