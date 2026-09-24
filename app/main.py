@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from .config import settings
 from .graph_store import GraphStore
 from .hydration import HydrationService
-from .routers import dig, health, hydrate
+from .routers import dig, health, hydrate, graph
 from .sparql_client import sparql_client
 
 
@@ -47,3 +47,4 @@ app = FastAPI(
 app.include_router(dig.router)
 app.include_router(hydrate.router)
 app.include_router(health.router)
+app.include_router(graph.router)

@@ -26,7 +26,7 @@ class Settings:
     # spend across every seed in its batch (structure + synonym hydration
     # combined). Once exhausted, traversal/enrichment stops gracefully and
     # whatever was already hydrated (this call or a previous one) is returned.
-    max_sparql_calls_per_request: int = int(os.getenv("MAX_SPARQL_CALLS_PER_REQUEST", "200"))
+    max_sparql_calls_per_request: int = int(os.getenv("MAX_SPARQL_CALLS_PER_REQUEST", "10000"))
 
     # Per-SPARQL-call HTTP timeout.
     sparql_timeout_seconds: float = float(os.getenv("SPARQL_TIMEOUT_SECONDS", "15"))

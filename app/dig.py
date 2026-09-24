@@ -21,11 +21,14 @@ The two endpoints differ only in output attribution:
     seed in the same batch, dedup here is per (node, seed) pair rather than
     global.
 """
+import logging
 from typing import Dict, List, Set, Tuple
 
 from .config import settings
 from .graph_store import GraphStore
 from .hydration import HydrationService, SparqlBudget
+
+logger = logging.getLogger(__name__)
 
 DigItem = Tuple[str, int, int, int]  # (seed_category, max_depth, return_categories, return_pages)
 
@@ -50,6 +53,18 @@ async def _enumerate_descendants(
         if is_category:
             if return_categories:
                 collected.append((child, seed))
+                # Hydrate synonyms for this match now, before recursing
+                # deeper. If we waited until the whole subtree had been
+                # walked (as run_dig used to), structure hydration for the
+                # rest of the tree would routinely burn through the entire
+                # shared budget first, leaving nothing for enrichment and
+                # synonyms_hydrated false on almost every node. Doing it here
+                # means budget is spent fairly between "go deeper" and
+                # "enrich what we already found", so matches collected
+                # earlier in the walk reliably get their synonyms even if
+                # the budget runs out later on.
+                if not store.is_synonyms_hydrated(child):
+                    await hydration.hydrate_synonyms(child, budget)
             if cur_depth < max_depth:
                 await _enumerate_descendants(
                     hydration, store, child, cur_depth + 1, max_depth,
@@ -58,6 +73,8 @@ async def _enumerate_descendants(
         else:
             if return_pages:
                 collected.append((child, seed))
+                if not store.is_synonyms_hydrated(child):
+                    await hydration.hydrate_synonyms(child, budget)
 
 
 def _prepare_output_legacy(store: GraphStore, matched: Set[str]) -> List[Dict[str, str]]:
@@ -103,6 +120,13 @@ async def run_dig(
         return_categories = bool(int(return_categories_raw))
         return_pages = bool(int(return_pages_raw))
 
+        if not await hydration.category_exists(seed_category, budget):
+            logger.warning(
+                "skipping seed, doesn't look like a real category: %s",
+                seed_category,
+            )
+            continue
+
         if not store.is_structure_hydrated(seed_category):
             await hydration.hydrate_category_structure(seed_category, budget)
         if not store.has_node(seed_category):
@@ -126,6 +150,18 @@ async def run_dig(
     for uri in all_uris:
         if not store.is_synonyms_hydrated(uri):
             await hydration.hydrate_synonyms(uri, budget)
+
+    if budget.exhausted:
+        logger.warning(
+            "dig batch finished with SPARQL budget exhausted: seeds=%d matched=%d used=%d limit=%d "
+            "— some results may be under-enriched or incomplete",
+            len(items), len(all_uris), budget.used, budget.limit,
+        )
+    else:
+        logger.info(
+            "dig batch finished within budget: seeds=%d matched=%d used=%d limit=%d",
+            len(items), len(all_uris), budget.used, budget.limit,
+        )
 
     if fixed:
         return _prepare_output_fixed(store, matched_fixed)

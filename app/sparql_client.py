@@ -110,6 +110,40 @@ class SparqlClient:
         payload = resp.json()
         return payload["results"]["bindings"]
 
+    async def _execute(self, client: httpx.AsyncClient, query: str) -> dict:
+        """Shared retry/throttle loop. Returns the raw decoded JSON payload;
+        callers pull out either `results.bindings` (SELECT) or `boolean`
+        (ASK)."""
+        attempt = 0
+        while True:
+            await self._throttle()
+            resp = await client.get(
+                self.endpoint,
+                params={"query": _PREFIXES + query, "format": "application/sparql-results+json"},
+                headers={"Accept": "application/sparql-results+json"},
+                timeout=self.timeout,
+            )
+            if resp.status_code in _RETRYABLE_STATUSES and attempt < self.max_retries:
+                attempt += 1
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    delay = float(retry_after) if retry_after else 2.0 * attempt
+                except ValueError:
+                    delay = 2.0 * attempt
+                await asyncio.sleep(delay)
+                continue
+            resp.raise_for_status()
+            break
+        return resp.json()
+
+    async def _run(self, client: httpx.AsyncClient, query: str) -> List[dict]:
+        payload = await self._execute(client, query)
+        return payload["results"]["bindings"]
+
+    async def _run_ask(self, client: httpx.AsyncClient, query: str) -> bool:
+        payload = await self._execute(client, query)
+        return bool(payload.get("boolean", False))
+
     async def fetch_subcategories(self, client: httpx.AsyncClient, local_name: str) -> List[str]:
         q = f"SELECT DISTINCT ?child WHERE {{ ?child skos:broader {_to_full_uri(local_name)} }}"
         rows = await self._run(client, q)
@@ -148,6 +182,21 @@ class SparqlClient:
         q = f"SELECT DISTINCT ?s WHERE {{ ?s dbo:wikiPageDisambiguates {_to_full_uri(local_name)} }}"
         rows = await self._run(client, q)
         return [_local_name_from_uri(r["s"]["value"]) for r in rows]
+
+    async def ask_category_exists(self, client: httpx.AsyncClient, local_name: str) -> bool:
+        """Single cheap ASK — true if the resource is a known category (either
+        typed as skos:Concept, or has at least one skos:broader edge in
+        either direction). Used to fail fast on a misspelled/unknown category
+        before spending the 2 calls a full structure hydration would cost."""
+        uri = _to_full_uri(local_name)
+        q = (
+            "ASK { "
+            f"{{ {uri} a skos:Concept }} UNION "
+            f"{{ {uri} skos:broader ?parent }} UNION "
+            f"{{ ?child skos:broader {uri} }} "
+            "}"
+        )
+        return await self._run_ask(client, q)
 
 
 sparql_client = SparqlClient(

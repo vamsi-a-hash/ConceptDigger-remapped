@@ -90,7 +90,7 @@ Returns `{"status": "ok", "graph_nodes": N, "graph_edges": M}`.
 |---|---|---|
 | `SPARQL_ENDPOINT` | `https://dbpedia.org/sparql` | Where hydration queries go |
 | `MAX_DEPTH_HARD_CAP` | `6` | Absolute ceiling on `max_depth`, regardless of request |
-| `MAX_SPARQL_CALLS_PER_REQUEST` | `200` | Shared SPARQL-call budget across an entire `/dig` batch |
+| `MAX_SPARQL_CALLS_PER_REQUEST` | `10000` | Shared SPARQL-call budget across an entire `/dig` batch |
 | `SPARQL_TIMEOUT_SECONDS` | `15` | Per-call HTTP timeout |
 | `CACHE_FILE_PATH` | `data/graph_cache.json` | Where the hydrated graph is persisted as JSON |
 | `PORT` | `5007` | HTTP port |

@@ -15,7 +15,7 @@ docker build -t "$IMAGE_NAME" .
 
 docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 
-docker run -d \
+MSYS_NO_PATHCONV=1 docker run -d \
   --name "$CONTAINER_NAME" \
   -p "${PORT}:5007" \
   -v "$(pwd)/data:/app/data" \
