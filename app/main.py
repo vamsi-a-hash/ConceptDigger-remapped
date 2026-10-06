@@ -8,7 +8,6 @@ handler shares the same in-memory graph and connection pool.
 Run directly with:
     uvicorn app.main:app --host 0.0.0.0 --port 5007
 
-(see start.sh for the containerized version)
 """
 from contextlib import asynccontextmanager
 
@@ -18,7 +17,7 @@ from fastapi import FastAPI
 from .config import settings
 from .graph_store import GraphStore
 from .hydration import HydrationService
-from .routers import dig, health, hydrate, graph
+from .routers import dig, health, hydrate, graph, graph_data
 from .sparql_client import sparql_client
 
 
@@ -48,3 +47,4 @@ app.include_router(dig.router)
 app.include_router(hydrate.router)
 app.include_router(health.router)
 app.include_router(graph.router)
+app.include_router(graph_data.router)
